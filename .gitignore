@@ -14,12 +14,6 @@ dist/
 
 # Photos et artefacts locaux
 photos/
-*.png
-*.jpg
-*.jpeg
-*.bmp
-*.gif
-*.ico
 
 # Logs et diagnostics
 *.log
