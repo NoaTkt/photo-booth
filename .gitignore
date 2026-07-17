@@ -18,3 +18,4 @@ photos/
 # Logs et diagnostics
 *.log
 diagnostics/
+backgrounds/*
