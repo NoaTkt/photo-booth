@@ -16,6 +16,11 @@ DIGICAM_BASE = "http://localhost:5513"
 CAPTURE_TRIGGER_TIMEOUT = 20  # s, requête ?slc=capture
 CAPTURE_WAIT_TIMEOUT = 25     # s, attente que lastcaptured change de valeur
 FILE_READ_TIMEOUT = 5         # s, attente que le fichier soit entièrement écrit sur disque
+POLL_INTERVAL = 0.1           # s, granularité du poll lastcaptured (localhost, sans risque)
+MAX_OUTPUT_LONG_EDGE = 2600   # px, définition max de la photo finale
+#                               24MP (6000px) est inutile pour une impression 10x15
+#                               (~1800px @ 300dpi) et ralentit compose/encodage côté UI ;
+#                               2600px reste >400dpi. Voir _downscale().
 
 
 class CameraAgent:
@@ -57,21 +62,24 @@ class CameraAgent:
     def _configure_capture_output(self):
         """Force digiCamControl à produire un JPEG plein format ENREGISTRÉ SUR LE PC.
 
-        Le Canon 2000D est souvent réglé en RAW seul (fichier .CR2 non lisible) et/ou
-        en « sauvegarde sur la carte » (rien n'arrive sur le PC). Best-effort : si un
-        réglage échoue, le fallback rawpy décode le RAW de toute façon.
+        Le Canon 2000D est souvent réglé en RAW seul (.CR2 ~25MB) : comme ?slc=capture
+        bloque jusqu'à la fin du transfert USB, la taille du fichier détermine la
+        latence — un JPEG Fine (~8MB, toujours 24MP) la divise par ~3-5. Best-effort :
+        si un réglage échoue, le fallback rawpy décode le RAW de toute façon.
         """
+        # Transfert vers le PC (sinon le fichier reste sur la carte SD)
         try:
-            self._slc("set", "transfer", "Save_to_PC_only")
+            values = [v.strip() for v in self._slc("list", "transfer").splitlines() if v.strip()]
+            pc = next((v for v in values if "pc" in v.lower()), None)
+            if pc:
+                self._slc("set", "transfer", pc)
         except Exception:
             pass
+        # Compression JPEG (Fine de préférence), jamais RAW
         try:
-            listing = self._slc("list", "compressionsetting")
-            values = [v.strip() for v in listing.splitlines() if v.strip()]
-            jpeg = next(
-                (v for v in values if "jpeg" in v.lower() and "raw" not in v.lower()),
-                None,
-            )
+            values = [v.strip() for v in self._slc("list", "compressionsetting").splitlines() if v.strip()]
+            jpeg_vals = [v for v in values if "jpeg" in v.lower() and "raw" not in v.lower()]
+            jpeg = next((v for v in jpeg_vals if "fine" in v.lower()), None) or (jpeg_vals[0] if jpeg_vals else None)
             if jpeg:
                 self._slc("set", "compressionsetting", jpeg)
         except Exception:
@@ -154,7 +162,7 @@ class CameraAgent:
                 path = self._get_last_captured()
                 if path and path != "-" and path != baseline:
                     return path
-                time.sleep(0.3)
+                time.sleep(POLL_INTERVAL)
         except Exception as e:
             raise RuntimeError(f"Erreur lors du déclenchement : {e}")
         raise RuntimeError(
@@ -291,12 +299,26 @@ class CameraAgent:
             )
         return frame
 
+    def _downscale(self, frame: np.ndarray) -> np.ndarray:
+        """Réduit la définition à MAX_OUTPUT_LONG_EDGE px sur le grand côté.
+
+        Accélère fortement compose/encodage/aperçu côté UI (thread principal). INTER_AREA
+        est l'interpolation adaptée à la réduction. No-op si déjà assez petit.
+        """
+        h, w = frame.shape[:2]
+        long_edge = max(h, w)
+        if long_edge <= MAX_OUTPUT_LONG_EDGE:
+            return frame
+        scale = MAX_OUTPUT_LONG_EDGE / long_edge
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
     def capture_full_frame(self) -> np.ndarray:
-        """Déclenche le reflex et retourne la photo pleine résolution, rognée 16:9
-        (même cadrage que le live view pour rester fidèle à l'aperçu)."""
+        """Déclenche le reflex et retourne la photo (rognée 16:9, redimensionnée pour
+        l'impression) — même cadrage que le live view pour rester fidèle à l'aperçu."""
         path = self.capture_photo()
         frame = self._load_capture_as_frame(path)
-        return self._crop_16_9(frame)
+        return self._downscale(self._crop_16_9(frame))
 
     def set_camera_index(self, camera_index: int):
         self.camera_index = camera_index
