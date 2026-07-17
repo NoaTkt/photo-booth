@@ -28,6 +28,7 @@ class CameraAgent:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._check_connection()
+        self._configure_capture_output()
         self._start_live_view()
 
     # ------------------------------------------------------------------
@@ -43,6 +44,38 @@ class CameraAgent:
                 "Impossible de joindre digiCamControl sur le port 5513.\n"
                 "Vérifiez que le logiciel est ouvert et que le webserver est activé."
             )
+
+    def _slc(self, cmd: str, param1: str = "", param2: str = "", timeout: int = 3) -> str:
+        """Envoie une single line command (slc) au webserver et retourne la réponse."""
+        r = requests.get(
+            f"{DIGICAM_BASE}/",
+            params={"slc": cmd, "param1": param1, "param2": param2},
+            timeout=timeout,
+        )
+        return r.text.strip()
+
+    def _configure_capture_output(self):
+        """Force digiCamControl à produire un JPEG plein format ENREGISTRÉ SUR LE PC.
+
+        Le Canon 2000D est souvent réglé en RAW seul (fichier .CR2 non lisible) et/ou
+        en « sauvegarde sur la carte » (rien n'arrive sur le PC). Best-effort : si un
+        réglage échoue, le fallback rawpy décode le RAW de toute façon.
+        """
+        try:
+            self._slc("set", "transfer", "Save_to_PC_only")
+        except Exception:
+            pass
+        try:
+            listing = self._slc("list", "compressionsetting")
+            values = [v.strip() for v in listing.splitlines() if v.strip()]
+            jpeg = next(
+                (v for v in values if "jpeg" in v.lower() and "raw" not in v.lower()),
+                None,
+            )
+            if jpeg:
+                self._slc("set", "compressionsetting", jpeg)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Live view
@@ -166,29 +199,95 @@ class CameraAgent:
         frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
         return frame
 
+    def _decode_raw(self, source) -> Optional[np.ndarray]:
+        """Décode un RAW (Canon .CR2/.CR3, Nikon .NEF, etc.) en frame BGR.
+
+        `source` est un chemin OU un objet fichier (BytesIO) : rawpy accepte les deux.
+        Le Canon 2000D enregistre en RAW : ni cv2 ni PIL ne savent le décoder. On
+        extrait d'abord le JPEG pleine résolution EMBARQUÉ dans le RAW — c'est le
+        rendu couleur du boîtier, identique à la photo « bouton » de digiCamControl.
+        À défaut, on démosaïque le RAW complet (couleurs LibRaw, un peu plus lent).
+        """
+        try:
+            import rawpy
+        except ImportError:
+            return None
+        try:
+            with rawpy.imread(source) as raw:
+                # 1) JPEG pleine résolution embarqué (rapide, couleurs boîtier)
+                try:
+                    thumb = raw.extract_thumb()
+                    if thumb.format == rawpy.ThumbFormat.JPEG:
+                        arr = np.frombuffer(thumb.data, dtype=np.uint8)
+                        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            return frame
+                except Exception:
+                    pass
+                # 2) Démosaïquage complet du RAW
+                rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception:
+            return None
+
+    def _decode_bytes(self, content: bytes) -> Optional[np.ndarray]:
+        """Décode des octets image (JPEG via cv2, sinon RAW via rawpy) en frame BGR."""
+        arr = np.frombuffer(content, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            return frame
+        return self._decode_raw(io.BytesIO(content))
+
+    def _download_capture(self, path: str) -> Optional[np.ndarray]:
+        """Télécharge le fichier capturé en bytes via le webserver (/image/<nom>).
+
+        Évite les problèmes de chemin disque, de permissions et d'Unicode : on ne
+        touche jamais au système de fichiers, digiCamControl sert les octets.
+        """
+        basename = path.replace("\\", "/").rsplit("/", 1)[-1]
+        if not basename:
+            return None
+        try:
+            r = requests.get(f"{DIGICAM_BASE}/image/{basename}", timeout=15)
+        except Exception:
+            return None
+        if r.status_code != 200 or len(r.content) < 1000:
+            return None
+        return self._decode_bytes(r.content)
+
     def _load_capture_as_frame(self, path: str) -> np.ndarray:
         """Charge le fichier capturé (pleine résolution) en frame BGR OpenCV."""
-        self._wait_until_file_stable(path)
+        # 1) Téléchargement HTTP direct (le plus robuste : ni chemin ni permissions)
+        frame = self._download_capture(path)
 
-        frame = self._read_image_unicode(path)
+        # 2) Repli lecture disque : JPEG (cv2 unicode-safe puis PIL) puis RAW rawpy
         if frame is None:
-            # Repli via PIL (formats/encodages que cv2 ne décode pas)
+            self._wait_until_file_stable(path)
+            frame = self._read_image_unicode(path)
+        if frame is None:
             try:
                 img = Image.open(path).convert("RGB")
                 frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
             except Exception:
                 frame = None
+        if frame is None:
+            frame = self._decode_raw(path)
 
         if frame is None:
             p = Path(path)
             exists = p.exists()
             size = p.stat().st_size if exists else 0
+            raw_ext = p.suffix.lower() in {".cr2", ".cr3", ".nef", ".arw", ".raf", ".dng"}
+            hint = (
+                "Fichier RAW : installez le décodeur avec « pip install rawpy »."
+                if raw_ext
+                else "Vérifiez que digiCamControl transfère bien le fichier sur le PC."
+            )
             raise RuntimeError(
                 "Impossible de lire la photo capturée.\n"
                 f"Fichier : {path}\n"
                 f"existe={exists}, taille={size} o, extension={p.suffix or '?'}\n"
-                "Si l'extension est .CR2/.CR3/.NEF (RAW), réglez digiCamControl "
-                "pour enregistrer aussi en JPEG."
+                f"{hint}"
             )
         return frame
 
