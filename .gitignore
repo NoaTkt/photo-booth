@@ -1,0 +1,26 @@
+# Environnements Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Builds / packaging
+build/
+dist/
+*.spec
+
+# Photos et artefacts locaux
+photos/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.ico
+
+# Logs et diagnostics
+*.log
+diagnostics/
