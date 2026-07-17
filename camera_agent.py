@@ -149,13 +149,30 @@ class CameraAgent:
             last_size = size
             time.sleep(0.2)
 
+    def _read_image_unicode(self, path: str) -> Optional[np.ndarray]:
+        """Lit une image en frame BGR en gérant les chemins non-ASCII.
+
+        cv2.imread échoue silencieusement (renvoie None) sur les chemins Unicode
+        sous Windows : on lit les octets via open() (qui gère l'Unicode) puis on
+        décode avec cv2.imdecode.
+        """
+        try:
+            with open(path, "rb") as f:
+                data = np.frombuffer(f.read(), dtype=np.uint8)
+        except OSError:
+            return None
+        if data.size == 0:
+            return None
+        frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        return frame
+
     def _load_capture_as_frame(self, path: str) -> np.ndarray:
         """Charge le fichier capturé (pleine résolution) en frame BGR OpenCV."""
         self._wait_until_file_stable(path)
 
-        frame: Optional[np.ndarray] = cv2.imread(path)
+        frame = self._read_image_unicode(path)
         if frame is None:
-            # Repli via PIL pour les JPEG que cv2 ne décode pas
+            # Repli via PIL (formats/encodages que cv2 ne décode pas)
             try:
                 img = Image.open(path).convert("RGB")
                 frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -163,9 +180,15 @@ class CameraAgent:
                 frame = None
 
         if frame is None:
+            p = Path(path)
+            exists = p.exists()
+            size = p.stat().st_size if exists else 0
             raise RuntimeError(
-                f"Impossible de lire la photo capturée ({path}).\n"
-                "Configurez digiCamControl pour enregistrer en JPEG (et non RAW seul)."
+                "Impossible de lire la photo capturée.\n"
+                f"Fichier : {path}\n"
+                f"existe={exists}, taille={size} o, extension={p.suffix or '?'}\n"
+                "Si l'extension est .CR2/.CR3/.NEF (RAW), réglez digiCamControl "
+                "pour enregistrer aussi en JPEG."
             )
         return frame
 
