@@ -1308,6 +1308,8 @@ class PhotoBoothUI(QMainWindow):
         self._capture_worker = CaptureWorker(self.camera_agent, self)
         self._capture_worker.captured.connect(self._on_capture_ready)
         self._capture_worker.failed.connect(self._on_capture_failed)
+        # Nettoyer le worker terminé (évite l'accumulation sur une longue session kiosque)
+        self._capture_worker.finished.connect(self._on_capture_worker_finished)
         self._capture_worker.start()
 
     def _on_capture_ready(self, frame):
@@ -1319,16 +1321,28 @@ class PhotoBoothUI(QMainWindow):
                 corner_radius=self.corner_radius,
                 scale_percent=self.photo_scale,
             )
-            self.set_status(f"Photo enregistree : {self.last_saved_photo}")
+        except Exception as error:
+            self._set_main_controls_enabled(True)
+            self.set_status(f"Impossible d'enregistrer : {error}", error=True)
+            return
+
+        self.set_status(f"Photo enregistree : {self.last_saved_photo}")
+        try:
             # _show_review garde les contrôles principaux désactivés pendant l'aperçu
             self._show_review(self.last_saved_photo)
         except Exception as error:
             self._set_main_controls_enabled(True)
-            self.set_status(f"Impossible d'enregistrer : {error}", error=True)
+            self.set_status(f"Photo enregistree mais apercu indisponible : {error}", error=True)
 
     def _on_capture_failed(self, message):
         self._set_main_controls_enabled(True)
         self.set_status(f"Erreur capture : {message}", error=True)
+
+    def _on_capture_worker_finished(self):
+        worker = self._capture_worker
+        self._capture_worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def print_last_photo(self):
         if not self.last_saved_photo:
@@ -1377,7 +1391,10 @@ class PhotoBoothUI(QMainWindow):
         self.status_label.setText(text)
 
     def closeEvent(self, event):
+        # Attendre la fin réelle de la capture avant de libérer : les timeouts internes
+        # bornent la durée (~50s max), donc pas de blocage infini possible. Un wait trop
+        # court détruirait le QThread en cours d'exécution (crash au teardown).
         if self._capture_worker is not None and self._capture_worker.isRunning():
-            self._capture_worker.wait(3000)
+            self._capture_worker.wait()
         self.camera_agent.release()
         event.accept()

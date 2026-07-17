@@ -1,6 +1,7 @@
 import io
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -128,20 +129,31 @@ class CameraAgent:
             "Vérifiez que la caméra est prête et que l'autofocus accroche."
         )
 
-    def _load_capture_as_frame(self, path: str) -> np.ndarray:
-        """Charge le fichier capturé (pleine résolution) en frame BGR OpenCV.
+    def _wait_until_file_stable(self, path: str) -> None:
+        """Attend que la taille du fichier se stabilise avant de le décoder.
 
-        Le fichier peut être encore en cours d'écriture quand lastcaptured change :
-        on réessaie la lecture jusqu'à FILE_READ_TIMEOUT.
+        lastcaptured peut changer avant la fin du transfert, et cv2.imread sur un
+        JPEG tronqué renvoie parfois une image partiellement décodée (bande grise)
+        au lieu d'échouer : on ne se fie donc pas au succès de imread mais à la
+        stabilité de la taille sur disque.
         """
         deadline = time.time() + FILE_READ_TIMEOUT
-        frame: Optional[np.ndarray] = None
+        last_size = -1
         while time.time() < deadline:
-            frame = cv2.imread(path)
-            if frame is not None:
-                break
+            try:
+                size = Path(path).stat().st_size
+            except OSError:
+                size = -1
+            if size > 0 and size == last_size:
+                return
+            last_size = size
             time.sleep(0.2)
 
+    def _load_capture_as_frame(self, path: str) -> np.ndarray:
+        """Charge le fichier capturé (pleine résolution) en frame BGR OpenCV."""
+        self._wait_until_file_stable(path)
+
+        frame: Optional[np.ndarray] = cv2.imread(path)
         if frame is None:
             # Repli via PIL pour les JPEG que cv2 ne décode pas
             try:
