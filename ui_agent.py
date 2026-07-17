@@ -1,7 +1,7 @@
 import cv2
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QSize, QObject, QEvent, QPoint, Signal
+from PySide6.QtCore import Qt, QTimer, QSize, QObject, QEvent, QPoint, Signal, QThread
 from PySide6.QtGui import QIcon, QImage, QPixmap, QColor
 from PySide6.QtWidgets import (
     QAbstractScrollArea,
@@ -499,6 +499,28 @@ class OverlayWidget(QWidget):
         super().resizeEvent(event)
 
 
+class CaptureWorker(QThread):
+    """Déclenche la vraie prise de vue reflex hors du thread UI.
+
+    La capture (shutter + transfert du fichier pleine résolution) bloque plusieurs
+    secondes : l'exécuter ici évite de figer l'interface et le live view.
+    """
+
+    captured = Signal(object)  # frame BGR numpy pleine résolution
+    failed = Signal(str)
+
+    def __init__(self, camera_agent, parent=None):
+        super().__init__(parent)
+        self.camera_agent = camera_agent
+
+    def run(self):
+        try:
+            frame = self.camera_agent.capture_full_frame()
+            self.captured.emit(frame)
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
 class PhotoBoothUI(QMainWindow):
     def __init__(self, camera_agent, photo_agent, print_agent):
         super().__init__()
@@ -508,6 +530,7 @@ class PhotoBoothUI(QMainWindow):
         self.last_frame = None
         self.last_saved_photo = None
         self.selected_gallery_photo = None
+        self._capture_worker = None
 
         self.setWindowTitle("PhotoBooth")
         self.setStyleSheet(f"QMainWindow {{ background: {BG_DARK}; }}")
@@ -1270,26 +1293,42 @@ class PhotoBoothUI(QMainWindow):
         )
         self.preview_label.setPixmap(pixmap)
 
+    def _set_main_controls_enabled(self, enabled: bool):
+        self.capture_button.setEnabled(enabled)
+        self.gallery_button.setEnabled(enabled)
+        self.settings_button.setEnabled(enabled)
+
     def capture_photo(self):
-        if self.last_frame is None:
-            self.set_status("Aucune image disponible.", error=True)
+        # Déclenche une vraie prise de vue reflex en arrière-plan : la photo finale
+        # provient du fichier pleine résolution de digiCamControl, pas du live view.
+        if self._capture_worker is not None and self._capture_worker.isRunning():
             return
+        self._set_main_controls_enabled(False)
+        self.set_status("Capture en cours...")
+        self._capture_worker = CaptureWorker(self.camera_agent, self)
+        self._capture_worker.captured.connect(self._on_capture_ready)
+        self._capture_worker.failed.connect(self._on_capture_failed)
+        self._capture_worker.start()
+
+    def _on_capture_ready(self, frame):
         try:
             self.last_saved_photo = self.photo_agent.save_photo(
-                self.last_frame,
+                frame,
                 background_path=self.selected_background_path,
                 overlay_path=self.selected_overlay_path,
                 corner_radius=self.corner_radius,
                 scale_percent=self.photo_scale,
             )
             self.set_status(f"Photo enregistree : {self.last_saved_photo}")
-            # Show review panel with the saved photo
-            try:
-                self._show_review(self.last_saved_photo)
-            except Exception:
-                pass
+            # _show_review garde les contrôles principaux désactivés pendant l'aperçu
+            self._show_review(self.last_saved_photo)
         except Exception as error:
+            self._set_main_controls_enabled(True)
             self.set_status(f"Impossible d'enregistrer : {error}", error=True)
+
+    def _on_capture_failed(self, message):
+        self._set_main_controls_enabled(True)
+        self.set_status(f"Erreur capture : {message}", error=True)
 
     def print_last_photo(self):
         if not self.last_saved_photo:
@@ -1338,5 +1377,7 @@ class PhotoBoothUI(QMainWindow):
         self.status_label.setText(text)
 
     def closeEvent(self, event):
+        if self._capture_worker is not None and self._capture_worker.isRunning():
+            self._capture_worker.wait(3000)
         self.camera_agent.release()
         event.accept()

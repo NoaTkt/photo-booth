@@ -10,6 +10,12 @@ from PIL import Image
 
 DIGICAM_BASE = "http://localhost:5513"
 
+# Déclenchement reflex : le shutter + le transfert du fichier pleine résolution
+# depuis la caméra vers le dossier de session peuvent prendre plusieurs secondes.
+CAPTURE_TRIGGER_TIMEOUT = 20  # s, requête ?slc=capture
+CAPTURE_WAIT_TIMEOUT = 25     # s, attente que lastcaptured change de valeur
+FILE_READ_TIMEOUT = 5         # s, attente que le fichier soit entièrement écrit sur disque
+
 
 class CameraAgent:
     """Pilote le Canon EOS via l'API HTTP de digiCamControl."""
@@ -93,24 +99,70 @@ class CameraAgent:
             frame = self._latest_frame.copy()
         return self._crop_16_9(frame)
 
-    def capture_photo(self) -> Optional[str]:
-        """Déclenche une prise de vue et retourne le chemin du fichier capturé."""
+    def _get_last_captured(self) -> str:
+        """Retourne le chemin du dernier fichier capturé connu de digiCamControl."""
+        r = requests.get(f"{DIGICAM_BASE}/?slc=get&param1=lastcaptured", timeout=3)
+        return r.text.strip()
+
+    def capture_photo(self) -> str:
+        """Déclenche une vraie prise de vue reflex et retourne le chemin du fichier
+        pleine résolution enregistré par digiCamControl.
+
+        On mémorise le dernier fichier capturé AVANT de déclencher, puis on attend
+        que cette valeur change : sinon la 2e capture renverrait immédiatement le
+        chemin de la photo précédente (avant que la nouvelle soit téléchargée).
+        """
         try:
-            # Déclencher
-            requests.get(f"{DIGICAM_BASE}/?slc=capture", timeout=15)
-            # Attendre que la photo soit disponible (max 10 s)
-            deadline = time.time() + 10
+            baseline = self._get_last_captured()
+            requests.get(f"{DIGICAM_BASE}/?slc=capture", timeout=CAPTURE_TRIGGER_TIMEOUT)
+            deadline = time.time() + CAPTURE_WAIT_TIMEOUT
             while time.time() < deadline:
-                r = requests.get(
-                    f"{DIGICAM_BASE}/?slc=get&param1=lastcaptured", timeout=3
-                )
-                path = r.text.strip()
-                if path and path != "-":
+                path = self._get_last_captured()
+                if path and path != "-" and path != baseline:
                     return path
                 time.sleep(0.3)
         except Exception as e:
             raise RuntimeError(f"Erreur lors du déclenchement : {e}")
-        return None
+        raise RuntimeError(
+            "digiCamControl n'a retourné aucune nouvelle photo après le déclenchement.\n"
+            "Vérifiez que la caméra est prête et que l'autofocus accroche."
+        )
+
+    def _load_capture_as_frame(self, path: str) -> np.ndarray:
+        """Charge le fichier capturé (pleine résolution) en frame BGR OpenCV.
+
+        Le fichier peut être encore en cours d'écriture quand lastcaptured change :
+        on réessaie la lecture jusqu'à FILE_READ_TIMEOUT.
+        """
+        deadline = time.time() + FILE_READ_TIMEOUT
+        frame: Optional[np.ndarray] = None
+        while time.time() < deadline:
+            frame = cv2.imread(path)
+            if frame is not None:
+                break
+            time.sleep(0.2)
+
+        if frame is None:
+            # Repli via PIL pour les JPEG que cv2 ne décode pas
+            try:
+                img = Image.open(path).convert("RGB")
+                frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            except Exception:
+                frame = None
+
+        if frame is None:
+            raise RuntimeError(
+                f"Impossible de lire la photo capturée ({path}).\n"
+                "Configurez digiCamControl pour enregistrer en JPEG (et non RAW seul)."
+            )
+        return frame
+
+    def capture_full_frame(self) -> np.ndarray:
+        """Déclenche le reflex et retourne la photo pleine résolution, rognée 16:9
+        (même cadrage que le live view pour rester fidèle à l'aperçu)."""
+        path = self.capture_photo()
+        frame = self._load_capture_as_frame(path)
+        return self._crop_16_9(frame)
 
     def set_camera_index(self, camera_index: int):
         self.camera_index = camera_index
