@@ -28,6 +28,7 @@ class CameraAgent:
 
     def __init__(self, camera_index: int = 0):
         self.camera_index = camera_index
+        self.aspect_ratio = (16, 9)  # ratio de cadrage du live view et des photos
         self._lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
         self._running = False
@@ -134,12 +135,12 @@ class CameraAgent:
     # ------------------------------------------------------------------
 
     def get_frame(self) -> np.ndarray:
-        """Retourne la dernière frame live view (rognée 16:9)."""
+        """Retourne la dernière frame live view (rognée au ratio courant)."""
         with self._lock:
             if self._latest_frame is None:
                 raise RuntimeError("Pas de frame disponible depuis le live view.")
             frame = self._latest_frame.copy()
-        return self._crop_16_9(frame)
+        return self._crop_to_ratio(frame)
 
     def _get_last_captured(self) -> str:
         """Retourne le chemin du dernier fichier capturé connu de digiCamControl."""
@@ -318,10 +319,14 @@ class CameraAgent:
         l'impression) — même cadrage que le live view pour rester fidèle à l'aperçu."""
         path = self.capture_photo()
         frame = self._load_capture_as_frame(path)
-        return self._downscale(self._crop_16_9(frame))
+        return self._downscale(self._crop_to_ratio(frame))
 
     def set_camera_index(self, camera_index: int):
         self.camera_index = camera_index
+
+    def set_aspect_ratio(self, ratio: tuple):
+        """Définit le ratio de cadrage, ex: (16, 9) ou (4, 3)."""
+        self.aspect_ratio = ratio
 
     def release(self):
         self._running = False
@@ -334,16 +339,17 @@ class CameraAgent:
         self._thread = None
 
     # ------------------------------------------------------------------
-    # Crop 16:9
+    # Crop au ratio courant (16:9 / 4:3)
     # ------------------------------------------------------------------
 
-    def _crop_16_9(self, frame: np.ndarray) -> np.ndarray:
+    def _crop_to_ratio(self, frame: np.ndarray) -> np.ndarray:
+        rw, rh = self.aspect_ratio
         h, w = frame.shape[:2]
         target_w = w
-        target_h = int(w * 9 / 16)
+        target_h = int(w * rh / rw)
         if target_h > h:
             target_h = h
-            target_w = int(h * 16 / 9)
+            target_w = int(h * rw / rh)
         x = (w - target_w) // 2
         y = (h - target_h) // 2
         return frame[y:y + target_h, x:x + target_w]

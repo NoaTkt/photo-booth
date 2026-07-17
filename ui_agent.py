@@ -810,9 +810,17 @@ class PhotoBoothUI(QMainWindow):
         cam_row, self.camera_value_label = _spinbox_row(
             "Index camera", 0, 10, self.camera_agent.camera_index, cam_card
         )
+        # Format d'image (ratio de cadrage) — live view + photo
+        ratios = ["16:9", "4:3"]
+        ratio_idx = 0 if self.camera_agent.aspect_ratio == (16, 9) else 1
+        self.aspect_row, self.aspect_value_label = _choice_button_row(
+            "Format :", ratios, ratio_idx, cam_card
+        )
+        self.aspect_value_label.textChanged.connect(self.update_aspect_ratio)
         self.output_format_label = QLabel("Format photo : 1280 x 720", cam_card)
         self.output_format_label.setStyleSheet(STYLE_LABEL_MUTED)
         cam_layout.addWidget(cam_row)
+        cam_layout.addWidget(self.aspect_row)
         cam_layout.addWidget(self.output_format_label)
         settings_layout.addWidget(cam_card)
 
@@ -1158,6 +1166,10 @@ class PhotoBoothUI(QMainWindow):
     def update_countdown_label(self, value):
         self.countdown_label_setting.setText(f"Duree du decompte : {value}s")
         self.countdown_duration = value
+
+    def update_aspect_ratio(self, text):
+        """Applique le ratio de cadrage (16:9 / 4:3) au live view et aux photos."""
+        self.camera_agent.set_aspect_ratio((4, 3) if text == "4:3" else (16, 9))
 
     def update_output_format_label(self):
         width, height = 1280, 720
